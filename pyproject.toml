@@ -1,0 +1,19 @@
+[project]
+name = "vme-helper-tools"
+version = "0.1.0"
+description = "VME helper tools - shared utilities and scripts for Team Center automation"
+authors = [
+    {name = "zuardinakbar"}
+]
+requires-python = ">=3.9"
+dependencies = [
+    "msal (>=1.0,<2.0)",
+    "requests (>=2.28,<2.33)",
+]
+
+[tool.poetry]
+packages = [{include = "scripts"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
