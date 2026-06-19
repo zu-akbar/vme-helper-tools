@@ -31,47 +31,13 @@ sys.path.insert(0, REPO_ROOT)
 from scripts.paths import ensure_dep_paths_on_sys_path
 ensure_dep_paths_on_sys_path(relative_to=REPO_ROOT)
 
-from team_center.TeamCenter import RequestFailed
 from team_center.TeamCenterFormats import revision_sort_key
 
 from scripts.logging import setup_logging
-from scripts.teamcenter import create_tc_session, paginate_search
+from scripts.teamcenter import create_tc_session
+from scripts.vme import fetch_all_vmes, fetch_vmes_by_super_designs
 
 logger = logging.getLogger("vme_export")
-
-
-def fetch_all_vmes(session, page_size=50):
-    """Retrieve all VME items from Team Center."""
-    logger.info("Searching for all VMEs...")
-    items = paginate_search(
-        session,
-        search_body={},
-        page_size=page_size,
-        query_elements={"ObjType": "VME"},
-    )
-    logger.info(f"Total VMEs found: {len(items)}")
-    return items
-
-
-def fetch_vmes_by_super_designs(session, super_design_ids, page_size=50):
-    """Retrieve VMEs matching given SuperDesign IDs."""
-    items = []
-    for sd_id in super_design_ids:
-        try:
-            found = paginate_search(
-                session,
-                search_body={},
-                page_size=page_size,
-                query_elements={
-                    "ObjType": "VME",
-                    "SuperDesign": str(sd_id),
-                },
-            )
-            logger.info(f"  SuperDesign {sd_id}: {len(found)} VME(s)")
-            items.extend(found)
-        except RequestFailed as e:
-            logger.error(f"Failed to search for SuperDesign {sd_id}: {e}")
-    return items
 
 
 def build_vme_rows(items):
@@ -135,8 +101,8 @@ def parse_args():
     )
     parser.add_argument(
         "--output",
-        default=os.path.join(SCRIPT_DIR, "vme_list.csv"),
-        help="Output CSV file path (default: tools/vme_list.csv)",
+        default=os.path.join(REPO_ROOT, "data", "output", "vme_list.csv"),
+        help="Output CSV file path (default: data/output/vme_list.csv)",
     )
     parser.add_argument(
         "--super-designs",

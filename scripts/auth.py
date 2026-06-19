@@ -47,7 +47,7 @@ class BearerAuth:
                 scopes=self._scopes, account=accounts[0]
             )
 
-        if not token_res:
+        if not token_res or "access_token" not in token_res:
             logger.info("Opening browser for interactive authentication...")
             token_res = self._app.acquire_token_interactive(scopes=self._scopes)
 

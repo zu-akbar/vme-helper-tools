@@ -1,0 +1,10 @@
+# Data / output
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+*.log
