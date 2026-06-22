@@ -1,18 +1,44 @@
 """
-Extract Render style from VME .ma files with a flattened hierarchy (no Styles node).
+Extract Render style from VME .ma files into a style-based hierarchy.
 
-Produces a cleaner scene structure where the Render node lives directly under
-the VME root, removing the unnecessary Styles wrapper.
+Restructures the VME content so that style-dependent geometry (Shell, Detail, Caps)
+lives under a Render group, while style-independent content (CommonParts, Cbox)
+sits as siblings. This produces a clean module that can serve as input for any
+downstream manifestation process.
 
-Before:  VME_11003001 → Styles → Render → {Shell, Detail, Caps, CommonParts}
-After:   VME_11003001 → Render → {Shell, Detail, Caps, CommonParts}
+Before:
+  VME_{SD} -> Styles -> Render -> {Shell, Detail, Caps, CommonParts}
+           -> Overrides
+           -> Connectivity -> {cbox_01..N}
+           -> Map_Data
+
+After:
+  VME_{SD} -> Render -> {Shell, Detail, Caps}
+           -> CommonParts -> {Knobs, Tubes}
+           -> Connectivity -> {cbox_01..N}
+           -> Map_Data
+           -> Overrides
+           -> Rig -> Skeleton (flex only)
+
+Preserved:
+  - Shading network (material assignments intact, meshes display in Maya)
+  - Render objectSets (BI, Crease, Black_faceset, SmartSection, CommonParts, Color_Change)
+  - Partitions (SmartSection, Faces, CommonParts, Edges)
+  - Custom attributes (VME_SmartType, VME_CommonPart*)
+  - Map_Data (Render_Without_Airgap reference)
+  - Overrides (authoring context)
+
+Removed:
+  - Non-Render styles (Realtime, BIPrint) and their objectSets
+  - Styles wrapper group (Render promoted directly under root)
+  - Unknown nodes (plugin artefacts)
 
 Run with:
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_flat.py [OPTIONS]
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_style.py [OPTIONS]
 
 Examples:
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_flat.py
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_flat.py --vme-ids VX0003001
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_style.py
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_style.py --vme-ids VX0003001
 """
 
 import sys
@@ -28,13 +54,13 @@ sys.path.insert(0, REPO_ROOT)
 from scripts.logging import setup_logging
 from scripts.maya_convert import initialize_maya, uninitialize_maya
 
-logger = logging.getLogger("render_manifestation_flat")
+logger = logging.getLogger("render_manifestation_style")
 
-NON_RENDER_MARKERS = ("_Realtime_", "_BIPrint_")
+NON_RENDER_SET_MARKERS = ("_Realtime_", "_BIPrint_")
 
 
-def flatten_styles_node(root):
-    """Remove the Styles grouping node, reparenting Render directly under root."""
+def restructure_to_style(root):
+    """Restructure VME into style-based hierarchy with CommonParts outside."""
     import maya.cmds
 
     styles_path = f"|{root}|Styles"
@@ -43,32 +69,55 @@ def flatten_styles_node(root):
     if not maya.cmds.objExists(render_path):
         raise RuntimeError(f"Render node not found: {render_path}")
 
-    # Delete non-Render styles first
+    # --- Delete non-Render styles (Realtime, BIPrint) ---
     styles_children = maya.cmds.listRelatives(styles_path, children=True, fullPath=True) or []
+    deleted_styles = []
     for child in styles_children:
-        if child.split("|")[-1] != "Render":
+        name = child.split("|")[-1]
+        if name != "Render":
             maya.cmds.delete(child)
+            deleted_styles.append(name)
+    if deleted_styles:
+        logger.debug(f"  Deleted styles: {', '.join(deleted_styles)}")
 
-    # Reparent Render directly under root (removes Styles wrapper)
+    # --- Move CommonParts out of Render, directly under root (style-independent) ---
+    common_parts_path = f"|{root}|Styles|Render|CommonParts"
+    if maya.cmds.objExists(common_parts_path):
+        maya.cmds.parent(common_parts_path, root)
+
+    # --- Promote Render directly under root (remove Styles wrapper) ---
     maya.cmds.parent(render_path, root)
 
-    # Delete the now-empty Styles node
+    # --- Delete now-empty Styles node ---
     if maya.cmds.objExists(styles_path):
         maya.cmds.delete(styles_path)
 
+    # Connectivity stays under root as-is
+
+    # Overrides stays under root
+    # Map_Data stays under root
+    # Rig stays under root (flex/articulated elements)
+
+    logger.debug(f"  Restructured to style hierarchy under {root}")
+
 
 def remove_non_render_sets():
-    """Delete objectSets belonging to non-Render styles."""
+    """Remove only objectSets belonging to non-Render styles (Realtime/BIPrint)."""
     import maya.cmds
 
     all_sets = maya.cmds.ls(type="objectSet") or []
+    deleted_count = 0
     for s in all_sets:
-        if any(marker in s for marker in NON_RENDER_MARKERS):
+        if any(marker in s for marker in NON_RENDER_SET_MARKERS):
             try:
                 maya.cmds.lockNode(s, lock=False)
                 maya.cmds.delete(s)
+                deleted_count += 1
             except Exception:
                 pass
+
+    if deleted_count:
+        logger.debug(f"  Deleted {deleted_count} non-Render objectSets")
 
 
 def remove_unknown_nodes():
@@ -98,7 +147,7 @@ def remove_unknown_nodes():
 
 
 def process_file(ma_path, output_path):
-    """Open a VME .ma, flatten Render hierarchy, save."""
+    """Open a VME .ma, restructure to style hierarchy, save."""
     import maya.cmds
 
     maya.cmds.file(ma_path, open=True, force=True, executeScriptNodes=False)
@@ -108,7 +157,7 @@ def process_file(ma_path, output_path):
         raise RuntimeError("No VME root node found")
 
     root = roots[0]
-    flatten_styles_node(root)
+    restructure_to_style(root)
     remove_non_render_sets()
     remove_unknown_nodes()
 
@@ -118,7 +167,7 @@ def process_file(ma_path, output_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Extract Render style with flattened hierarchy (no Styles node)",
+        description="Extract Render style with CommonParts separated (style-based hierarchy)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -129,8 +178,8 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join(REPO_ROOT, "data", "output", "render-manifestation-flat"),
-        help="Output directory (default: data/output/render-manifestation-flat)",
+        default=os.path.join(REPO_ROOT, "data", "output", "render-manifestation-style"),
+        help="Output directory (default: data/output/render-manifestation-style)",
     )
     parser.add_argument(
         "--vme-ids",
@@ -180,7 +229,7 @@ def main():
             prefix = f"[{idx}/{len(ma_files)}] {filename}"
 
             try:
-                logger.info(f"{prefix} - flattening...")
+                logger.info(f"{prefix} - extracting style...")
                 process_file(ma_path, output_path)
                 logger.info(f"{prefix} - DONE")
                 success_count += 1

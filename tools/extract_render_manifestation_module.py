@@ -1,16 +1,18 @@
 """
-Extract the Render style from VME .ma files into standalone .ma files.
+Extract Render style from VME .ma files as a standalone module (no Styles or Render groups).
 
-Removes non-Render styles (Realtime, BIPrint) and their associated objectSets,
-keeping only the Render geometry, global data, and Render-related sets.
+Produces the flattest possible hierarchy: Shell, Detail, Caps, CommonParts,
+and global data (Overrides, Connectivity, Map_Data) live directly under the VME root.
+
+Before:  VME_11003001 -> Styles -> Render -> {Shell, Detail, Caps, CommonParts}
+After:   VME_11003001 -> {Shell, Detail, Caps, CommonParts, Overrides, Connectivity, Map_Data}
 
 Run with:
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation.py [OPTIONS]
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_module.py [OPTIONS]
 
 Examples:
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation.py
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation.py --input-dir data/output/VME
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation.py --vme-ids VX0003001 VX0049097
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_module.py
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_module.py --vme-ids VX0003001
 """
 
 import sys
@@ -26,50 +28,58 @@ sys.path.insert(0, REPO_ROOT)
 from scripts.logging import setup_logging
 from scripts.maya_convert import initialize_maya, uninitialize_maya
 
-logger = logging.getLogger("render_extract")
+logger = logging.getLogger("render_manifestation_module")
 
-NON_RENDER_STYLES = ("Realtime", "BIPrint")
-NON_RENDER_SET_MARKERS = ("_Realtime_", "_BIPrint_")
+NON_RENDER_MARKERS = ("_Realtime_", "_BIPrint_")
 
 
-def extract_render_style():
-    """Remove non-Render styles and their sets from the current scene."""
+def flatten_to_module(root):
+    """Remove Styles and Render groups, promoting Render children directly under root."""
     import maya.cmds
 
-    roots = [t for t in maya.cmds.ls(assemblies=True) if t.startswith("VME_")]
-    if not roots:
-        raise RuntimeError("No VME root node found in scene")
-
-    root = roots[0]
     styles_path = f"|{root}|Styles"
+    render_path = f"|{root}|Styles|Render"
 
-    if not maya.cmds.objExists(styles_path):
-        raise RuntimeError(f"Styles node not found: {styles_path}")
+    if not maya.cmds.objExists(render_path):
+        raise RuntimeError(f"Render node not found: {render_path}")
 
-    children = maya.cmds.listRelatives(styles_path, children=True, fullPath=True) or []
-    deleted_styles = []
-    for child in children:
-        name = child.split("|")[-1]
-        if name != "Render":
+    # Delete non-Render styles first
+    styles_children = maya.cmds.listRelatives(styles_path, children=True, fullPath=True) or []
+    for child in styles_children:
+        if child.split("|")[-1] != "Render":
             maya.cmds.delete(child)
-            deleted_styles.append(name)
 
-    if deleted_styles:
-        logger.debug(f"  Deleted styles: {', '.join(deleted_styles)}")
+    # Get Render's children (Shell, Detail, Caps, CommonParts)
+    render_children = maya.cmds.listRelatives(render_path, children=True, fullPath=True) or []
+
+    # Reparent each Render child directly under root
+    for child in render_children:
+        maya.cmds.parent(child, root)
+
+    # Delete the now-empty Render node
+    if maya.cmds.objExists(render_path):
+        maya.cmds.delete(render_path)
+
+    # Delete the now-empty Styles node
+    if maya.cmds.objExists(styles_path):
+        maya.cmds.delete(styles_path)
+
+    child_names = [c.split("|")[-1] for c in render_children]
+    logger.debug(f"  Promoted to root: {', '.join(child_names)}")
+
+
+def remove_non_render_sets():
+    """Delete objectSets belonging to non-Render styles."""
+    import maya.cmds
 
     all_sets = maya.cmds.ls(type="objectSet") or []
-    deleted_sets = 0
     for s in all_sets:
-        if any(marker in s for marker in NON_RENDER_SET_MARKERS):
+        if any(marker in s for marker in NON_RENDER_MARKERS):
             try:
                 maya.cmds.lockNode(s, lock=False)
                 maya.cmds.delete(s)
-                deleted_sets += 1
             except Exception:
                 pass
-
-    if deleted_sets:
-        logger.debug(f"  Deleted {deleted_sets} non-Render objectSets")
 
 
 def remove_unknown_nodes():
@@ -87,32 +97,39 @@ def remove_unknown_nodes():
         if full_path and "|Connectivity|" in full_path[0]:
             connectivity_shapes.add(node)
 
-    to_delete = [n for n in unknown_nodes + unknown_dag if n not in connectivity_shapes]
-    if to_delete:
-        logger.debug(f"  Removing {len(to_delete)} unknown node(s) (keeping {len(connectivity_shapes)} connectivity shape(s))...")
-        for node in to_delete:
-            if maya.cmds.objExists(node):
-                try:
-                    maya.cmds.lockNode(node, lock=False)
-                    maya.cmds.delete(node)
-                except Exception:
-                    pass
+    for node in unknown_nodes + unknown_dag:
+        if node in connectivity_shapes:
+            continue
+        if maya.cmds.objExists(node):
+            try:
+                maya.cmds.lockNode(node, lock=False)
+                maya.cmds.delete(node)
+            except Exception:
+                pass
 
 
 def process_file(ma_path, output_path):
-    """Open a .ma file, extract Render style, save to output."""
+    """Open a VME .ma, flatten to module hierarchy, save."""
     import maya.cmds
 
     maya.cmds.file(ma_path, open=True, force=True, executeScriptNodes=False)
-    extract_render_style()
+
+    roots = [t for t in maya.cmds.ls(assemblies=True) if t.startswith("VME_")]
+    if not roots:
+        raise RuntimeError("No VME root node found")
+
+    root = roots[0]
+    flatten_to_module(root)
+    remove_non_render_sets()
     remove_unknown_nodes()
+
     maya.cmds.file(rename=output_path)
     maya.cmds.file(save=True, type="mayaAscii", executeScriptNodes=False)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Extract Render manifestation from VME .ma files",
+        description="Extract Render style as standalone module (no Styles/Render groups)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -123,8 +140,8 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join(REPO_ROOT, "data", "output", "Render-Manifestation"),
-        help="Output directory (default: data/output/Render-Manifestation)",
+        default=os.path.join(REPO_ROOT, "data", "output", "render-manifestation-module"),
+        help="Output directory (default: data/output/render-manifestation-module)",
     )
     parser.add_argument(
         "--vme-ids",
@@ -136,13 +153,8 @@ def parse_args():
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
-        help="Logging verbosity (default: INFO)",
     )
-    parser.add_argument(
-        "--log-file",
-        metavar="PATH",
-        help="Also write log output to this file",
-    )
+    parser.add_argument("--log-file", metavar="PATH")
     return parser.parse_args()
 
 
@@ -179,7 +191,7 @@ def main():
             prefix = f"[{idx}/{len(ma_files)}] {filename}"
 
             try:
-                logger.info(f"{prefix} - extracting Render...")
+                logger.info(f"{prefix} - extracting module...")
                 process_file(ma_path, output_path)
                 logger.info(f"{prefix} - DONE")
                 success_count += 1
