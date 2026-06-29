@@ -38,7 +38,7 @@ def _ensure_lego_ca_bundle():
         logger.debug(f"REQUESTS_CA_BUNDLE set to: {ca_path}")
 
 
-def create_tc_session(environment, *, client_id=None, authority=None, scopes=None, timeout=120):
+def create_tc_session(environment, *, client_id=None, authority=None, scopes=None, timeout=120, dryrun=False):
     """Create an authenticated Team Center session.
 
     Requires team_center.TeamCenter.Session to be importable (via ensure_dep_paths_on_sys_path).
@@ -54,7 +54,7 @@ def create_tc_session(environment, *, client_id=None, authority=None, scopes=Non
     msal_app = create_msal_app(client_id=client_id, authority=authority)
     auth = BearerAuth(msal_app, scopes=scopes or SCOPES)
     session = TeamCenterSession(
-        environment=environment, authenticate=auth, timeout=timeout
+        environment=environment, authenticate=auth, timeout=timeout, dryrun=dryrun
     )
     logger.info(f"Connected to Team Center ({environment}) as: {session.get_username()}")
     return session
@@ -81,3 +81,87 @@ def paginate_search(session, search_body, page_size, query_elements):
         all_items.extend(items)
 
     return all_items
+
+
+# ---------------------------------------------------------------------------
+# Extended API wrappers (endpoints not directly on Session)
+# ---------------------------------------------------------------------------
+
+
+def get_session_info(session):
+    """GET /session."""
+    url = session.build_url(path_elements=["session"])
+    return session._get(url)
+
+
+def search_items_paginated(session, entries, *, page_size=50, sort=None, all_files=False, references=None):
+    """Paginating item search with sort/allfiles/references support."""
+    query_elements = {}
+    if sort:
+        query_elements["_sort"] = sort
+    if all_files:
+        query_elements["allfiles"] = None
+    if references:
+        query_elements["References"] = references
+
+    search_body = {}
+    if entries:
+        search_body["entries"] = entries
+
+    return paginate_search(session, search_body, page_size, query_elements or None)
+
+
+def search_scheme(session, scheme, fields, *, page_size=None):
+    """POST /search/scheme/{scheme}."""
+    query_elements = {}
+    if page_size:
+        query_elements["_pagesize"] = str(page_size)
+    url = session.build_url(
+        path_elements=["search", "scheme", scheme],
+        query_elements=query_elements or None,
+    )
+    return session._post(url, {"_DATA": fields})
+
+
+def get_bom_product(session, product_id, *, explode=False):
+    """GET /boms/product/{id}."""
+    query_elements = {"explode": None} if explode else None
+    url = session.build_url(
+        path_elements=["boms", "product", str(product_id)],
+        query_elements=query_elements,
+    )
+    return session._get(url)
+
+
+def get_masterdata(session):
+    """GET /masterdata."""
+    url = session.build_url(path_elements=["masterdata"])
+    return session._get(url)
+
+
+def get_search_scheme_definition(session, scheme):
+    """GET /search/scheme/{scheme} — returns the scheme definition."""
+    url = session.build_url(path_elements=["search", "scheme", scheme])
+    return session._get(url)
+
+
+def resolve_identifier(session, identifier):
+    """GET /resolver/{id}."""
+    url = session.build_url(path_elements=["resolver", str(identifier)])
+    return session._get(url)
+
+
+def get_report_elements_by_type(session, element_type):
+    """GET /lego/Report/3DFLOW.list.type?argA={type}.
+
+    Uses /lego/ base path instead of /legotcapi2/.
+    """
+    tc_url = os.environ.get("TC_URL", "")
+    base = tc_url.rsplit("/legotcapi2", 1)[0] if "/legotcapi2" in tc_url else tc_url.rsplit("/", 1)[0]
+    report_url = f"{base}/lego/Report/3DFLOW.list.type?argA={element_type}"
+    response = session.session.get(report_url, timeout=session.timeout)
+    session._raise_if_response_not_ok(response, report_url)
+    try:
+        return response.json()
+    except ValueError:
+        return {"_RAW": response.text}

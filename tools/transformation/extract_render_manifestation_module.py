@@ -1,18 +1,22 @@
 """
-Extract Render style from VME .ma files as a standalone module (no Styles or Render groups).
+Extract Render style from VME .ma files as a simplified standalone module.
 
-Produces the flattest possible hierarchy: Shell, Detail, Caps, CommonParts,
-and global data (Overrides, Connectivity, Map_Data) live directly under the VME root.
+Target hierarchy:
+  VME_Geometries/{Shell, Detail, Caps}
+  CommonParts/{Knobs, Tubes, Logo}
+  Overrides
+  Map_Data/Normal/Source/Render_Without_Airgap
+  Rig/Skeleton
+  VME_Sets/{EdgeSets, CommonPartSets, SmartSectionSets, FaceSets, OverrideSectionSets}
 
-Before:  VME_11003001 -> Styles -> Render -> {Shell, Detail, Caps, CommonParts}
-After:   VME_11003001 -> {Shell, Detail, Caps, CommonParts, Overrides, Connectivity, Map_Data}
+Original VME identity (SuperDesign, ID, Revision, Style) stored as fileInfo metadata.
 
 Run with:
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_module.py [OPTIONS]
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/transformation/extract_render_manifestation_module.py [OPTIONS]
 
 Examples:
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_module.py
-    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/extract_render_manifestation_module.py --vme-ids VX0003001
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/transformation/extract_render_manifestation_module.py
+    & "C:\\Program Files\\Autodesk\\Maya2023\\bin\\mayapy.exe" tools/transformation/extract_render_manifestation_module.py --vme-ids VX0003001
 """
 
 import sys
@@ -22,7 +26,7 @@ import logging
 import glob
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 from scripts.logging import setup_logging
@@ -34,7 +38,7 @@ NON_RENDER_MARKERS = ("_Realtime_", "_BIPrint_")
 
 
 def flatten_to_module(root):
-    """Remove Styles and Render groups, promoting Render children directly under root."""
+    """Remove Styles/Render wrappers and collapse the Shell intermediate transform."""
     import maya.cmds
 
     styles_path = f"|{root}|Styles"
@@ -64,8 +68,58 @@ def flatten_to_module(root):
     if maya.cmds.objExists(styles_path):
         maya.cmds.delete(styles_path)
 
+    # Collapse Shell: VME/Shell/Shell/ShellShape -> VME/Shell/ShellShape
+    collapse_shell(root)
+
     child_names = [c.split("|")[-1] for c in render_children]
     logger.debug(f"  Promoted to root: {', '.join(child_names)}")
+
+
+def collapse_shell(root):
+    """Collapse the intermediate Shell transform: Shell/Shell/ShellShape -> Shell/ShellShape."""
+    import maya.cmds
+
+    shell_group = f"|{root}|Shell"
+    if not maya.cmds.objExists(shell_group):
+        return
+
+    inner_shell = f"|{root}|Shell|Shell"
+    if not maya.cmds.objExists(inner_shell):
+        return
+
+    # Transfer custom attributes from inner Shell to outer Shell
+    user_attrs = maya.cmds.listAttr(inner_shell, userDefined=True) or []
+    for attr in user_attrs:
+        attr_type = maya.cmds.getAttr(f"{inner_shell}.{attr}", type=True)
+        value = maya.cmds.getAttr(f"{inner_shell}.{attr}")
+        if not maya.cmds.attributeQuery(attr, node=shell_group, exists=True):
+            if attr_type == "string":
+                maya.cmds.addAttr(shell_group, longName=attr, dataType="string")
+                maya.cmds.setAttr(f"{shell_group}.{attr}", value, type="string")
+            else:
+                maya.cmds.addAttr(shell_group, longName=attr, attributeType=attr_type)
+                maya.cmds.setAttr(f"{shell_group}.{attr}", value)
+
+    # Transfer .iog connections (objectSet memberships) from inner Shell to outer Shell
+    iog_connections = maya.cmds.listConnections(f"{inner_shell}.iog", source=False, destination=True, plugs=True) or []
+    for dest_plug in iog_connections:
+        maya.cmds.connectAttr(f"{shell_group}.iog", dest_plug, force=True)
+
+    # Reparent shapes under the inner Shell up to the outer Shell group
+    inner_shapes = maya.cmds.listRelatives(inner_shell, shapes=True, fullPath=True) or []
+    for shape in inner_shapes:
+        maya.cmds.parent(shape, shell_group, relative=True, shape=True)
+
+    # Reparent any remaining transform children
+    inner_transforms = maya.cmds.listRelatives(inner_shell, children=True, type="transform", fullPath=True) or []
+    for xform in inner_transforms:
+        maya.cmds.parent(xform, shell_group)
+
+    # Delete the now-empty inner Shell transform
+    if maya.cmds.objExists(inner_shell):
+        maya.cmds.delete(inner_shell)
+
+    logger.debug(f"  Collapsed Shell hierarchy")
 
 
 def remove_non_render_sets():
@@ -108,6 +162,56 @@ def remove_unknown_nodes():
                 pass
 
 
+
+def restructure_hierarchy(root, filename):
+    """Reorganize into target hierarchy: VME_Geometries, CommonParts, Overrides, Map_Data, Rig, VME_Sets."""
+    import maya.cmds
+
+    super_design = root.replace("VME_", "", 1)
+
+    # Store original VME identity as global fileInfo metadata
+    vme_id = filename.rsplit("_", 1)[0] if "_" in filename else filename
+    revision = filename.rsplit("_", 1)[1] if "_" in filename else ""
+    maya.cmds.fileInfo("VME_SuperDesign", super_design)
+    maya.cmds.fileInfo("VME_ID", vme_id)
+    maya.cmds.fileInfo("VME_Revision", revision)
+    maya.cmds.fileInfo("VME_Style", "Render")
+
+    # Create VME_Geometries group and move geometry children into it
+    vme_geo = maya.cmds.createNode("transform", name="VME_Geometries", parent=root)
+    for child_name in ("Shell", "Detail", "Caps"):
+        child_path = f"|{root}|{child_name}"
+        if maya.cmds.objExists(child_path):
+            maya.cmds.parent(child_path, vme_geo)
+
+    # Move CommonParts to root level (sibling to VME_Geometries)
+    # It's already under root from flatten_to_module, nothing to do
+
+    # Remove Connectivity (not part of target hierarchy)
+    conn_path = f"|{root}|Connectivity"
+    if maya.cmds.objExists(conn_path):
+        maya.cmds.delete(conn_path)
+
+    # Rename VME_Data -> VME_Sets
+    vme_data_name = f"VME_Data_{super_design}"
+    if maya.cmds.objExists(vme_data_name):
+        maya.cmds.rename(vme_data_name, "VME_Sets")
+
+
+    # Rename the VME root (remove SuperDesign) — do this last since paths change
+    maya.cmds.rename(root, "VME")
+
+    # Enforce child ordering under VME root
+    desired_order = ["VME_Geometries", "CommonParts", "Rig", "Map_Data", "Overrides"]
+    for name in reversed(desired_order):
+        path = f"|VME|{name}"
+        if maya.cmds.objExists(path):
+            maya.cmds.reorder(path, front=True)
+
+    logger.debug(f"  Restructured hierarchy, stored metadata: SD={super_design} ID={vme_id} Rev={revision}")
+    return "VME"
+
+
 def process_file(ma_path, output_path):
     """Open a VME .ma, flatten to module hierarchy, save."""
     import maya.cmds
@@ -119,9 +223,11 @@ def process_file(ma_path, output_path):
         raise RuntimeError("No VME root node found")
 
     root = roots[0]
+    filename = os.path.splitext(os.path.basename(ma_path))[0]
     flatten_to_module(root)
     remove_non_render_sets()
     remove_unknown_nodes()
+    restructure_hierarchy(root, filename)
 
     maya.cmds.file(rename=output_path)
     maya.cmds.file(save=True, type="mayaAscii", executeScriptNodes=False)
@@ -129,7 +235,7 @@ def process_file(ma_path, output_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Extract Render style as standalone module (no Styles/Render groups)",
+        description="Extract Render style as simplified module (collapsed Shell, no Styles/Render groups)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

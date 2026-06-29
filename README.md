@@ -8,17 +8,23 @@ Shared utilities and tool scripts for automating Team Center workflows (VME down
 vme-helper-tools/
 ├── scripts/                                  # Shared Python package (importable)
 │   ├── auth.py                               # Azure AD / MSAL authentication
-│   ├── teamcenter.py                         # Team Center session & paginated search
+│   ├── teamcenter.py                         # Team Center session & paginated search + API wrappers
+│   ├── tc_output.py                          # Output formatting (JSON, CSV, file/stdout)
 │   ├── vme.py                                # VME enumeration, revision, download
 │   ├── maya_convert.py                       # Maya standalone init/teardown, .mb→.ma
 │   ├── logging.py                            # Shared logging configuration
 │   └── paths.py                              # Corporate dependency path resolution
 ├── tools/                                    # Tool scripts (all require mayapy unless noted)
+│   ├── tc_api.py                             # TC REST API CLI — all endpoints (no Maya needed)
 │   ├── fetch_and_convert_ma.py               # Download VMEs from TC and convert .mb → .ma
 │   ├── export_vme_list.py                    # Export CSV of VMEs (no Maya needed)
-│   ├── extract_render_manifestation.py       # Extract Render-only .ma (removes other styles)
-│   ├── extract_render_manifestation_flat.py  # Same but flattens Styles node out
-│   └── diagnose_render_manifestation.py      # Diagnostic + export-style (ved_tool replication)
+│   ├── pipeline_full_corpus.py               # Full pipeline: fetch + extract + collect (resumable)
+│   └── transformation/                       # Render Manifestation extraction variants
+│       ├── extract_render_manifestation.py       # Option A: Normal hierarchy
+│       ├── extract_render_manifestation_flat.py  # Option B: Flat (no Styles node)
+│       ├── extract_render_manifestation_module.py # Option C: Module (no Styles or Render)
+│       ├── extract_render_manifestation_style.py  # Option D: Style (CommonParts separated)
+│       └── diagnose_render_manifestation.py      # Diagnostic + export-style replication
 └── data/
     ├── input/                                # Source files (xls, pdf, csv)
     └── output/                               # Generated outputs (gitignored)
@@ -87,14 +93,51 @@ The `TC_URL` environment variable can override the endpoint if set (the `team_ce
 
 ## Authentication Flow
 
-1. On first run, a browser window opens for LEGO Azure AD login
-2. After successful login, tokens are cached by MSAL in memory
-3. Subsequent runs within the same session reuse the cached token silently
-4. Token auto-refreshes if it expires during a long batch run
+Uses **Azure AD (Entra ID)** via MSAL `PublicClientApplication` with OAuth2 interactive browser flow.
+
+### Credentials
+
+| Setting | Value |
+|---------|-------|
+| Client ID | `cf749082-77bc-4abd-aea9-92b0d337f38a` |
+| Tenant ID | `1d063515-6cad-4195-9486-ea65df456faa` |
+| Authority | `https://login.microsoftonline.com/1d063515-6cad-4195-9486-ea65df456faa` |
+| Scopes | `api://cf749082-77bc-4abd-aea9-92b0d337f38a/user_impersonation` |
+| Token type | Bearer (injected in `Authorization` header) |
+
+### How it works
+
+1. On first run, a browser window opens for LEGO Azure AD login (your personal corporate account)
+2. After successful login, the access token is cached by MSAL **in memory only** (no persistent disk cache)
+3. Subsequent API calls within the same process reuse the cached token silently
+4. Token auto-refreshes if it expires during a long batch run (~1 hour validity)
+5. Every new process invocation requires a fresh interactive login
+
+There is **no service account** — all API calls are made as the authenticated user (`user_impersonation` scope). The username is logged on connection: `Connected to Team Center (prod) as: {username}`.
+
+### API Request Pattern
+
+All requests go through `team_center.TeamCenter.Session` (from `dep-dwf-maya-python`):
+
+| Operation | Method | Endpoint |
+|-----------|--------|----------|
+| Get item by ID | GET | `/items/{TCID}?allrevs` |
+| Search items | POST | `/items?ObjType=VME&_pagesize=50` |
+| Next search page | POST | (uses cursor from previous response) |
+| Download spec file | GET | `/items/{TCID}/specifications/mb/vme.mb?Rev={REV}` |
+| Get session info | GET | `/session` |
+| Search by scheme | POST | `/search/scheme/{scheme}` |
+| BOM product | GET | `/boms/product/{id}` |
+| Resolve identifier | GET | `/resolver/{id}` |
+| Report (3DFLOW) | GET | `{base}/lego/Report/3DFLOW.list.type?argA={type}` |
+
+Response data lives under the `_DATA` key. Pagination is handled by `paginate_search()` which calls `search_items` then loops `search_items_next_page` until exhausted.
 
 ## TLS / CA Certificates
 
 Maya's bundled Python (`mayapy.exe`) does not ship a system CA certificate store. The tooling automatically sets `REQUESTS_CA_BUNDLE` to the LEGO CA bundle at `dep-dwf-maya-python/python_externals/team_center_qnetwork/lego_ca/lego_cacert.crt`. This is the same mechanism used by the ved_tool (set at import time via `team_center_qnetwork.Network`).
+
+Without this bundle, HTTPS connections to `*.corp.lego.com` will **hang indefinitely** (the corporate CA is not in the default system trust store).
 
 ## Tools
 
@@ -197,6 +240,107 @@ Diagnoses Render Manifestation files and replicates the ved_tool export-style pr
 ```
 
 Export-style output uses ved_tool naming convention (`m11003001.ma`) and is saved to `data/output/Export-Style/`.
+
+### TC API CLI
+
+Unified command-line access to all Team Center REST API endpoints. No Maya required. Covers items, BOMs, recipes, materials, search schemes, workflows, and more.
+
+```bash
+poetry run python tools/tc_api.py <command> [options]
+```
+
+#### Subcommands
+
+| Command | Description |
+|---------|-------------|
+| `auth` | Verify authentication |
+| `session` | Show session info |
+| `items get TCID` | Get item by TCID (`--allrevs`, `--allfiles`) |
+| `items search` | Search items (`--type`, `--field K=V`, `--sort`, `--references`) |
+| `items refs TCID` | Find items referencing a TCID |
+| `items checkout TCID [...]` | Checkout items |
+| `items checkin TCID [...]` | Checkin items |
+| `items revise TCID [...]` | Revise items |
+| `items set-refs TCID` | Set reference relationships (`--ref TCID:REV:NAME`) |
+| `items props TCID` | Update properties (`--json-file PATH`) |
+| `items create TYPE NAME` | Create item (`--json-file PATH`) |
+| `items workflow NAME TCID [...]` | Trigger workflow |
+| `items baseline NAME TCID [...]` | Set baseline |
+| `items release NAME TCID [...]` | Release items |
+| `bom get PRODUCT_ID` | Get BOM (`--explode`) |
+| `bom search SCHEME` | Search using scheme (`--field K=V`) |
+| `recipes get ID` | Get recipe |
+| `recipes update ID` | Update recipe (`--json-file PATH`) |
+| `recipes delete ID` | Delete recipe |
+| `materials TCID` | Get material by TCID |
+| `masterdata` | Get master data |
+| `search scheme NAME` | Get search scheme definition |
+| `search run NAME` | Execute scheme-based search (`--field K=V`) |
+| `resolver ID` | Resolve identifier |
+| `magic TCID REV` | Get magic hash |
+| `report` | List elements by type (`--type TYPE`) |
+
+#### Global Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--env` | `prod` | Team Center environment (`dev` or `prod`) |
+| `--format` | `json` | Output format (`json` or `csv`) |
+| `--output PATH` | stdout | Write result to file |
+| `--page-size` | `50` | Search pagination size |
+| `--timeout` | `120` | Request timeout in seconds |
+| `--dry-run` | — | Skip write operations |
+| `--log-level` | `INFO` | Logging verbosity |
+| `--log-file` | — | Write logs to file |
+
+#### Examples
+
+```bash
+# Verify authentication against dev
+poetry run python tools/tc_api.py auth --env dev
+
+# Get item with all revisions
+poetry run python tools/tc_api.py items get VX0003001 --allrevs
+
+# Search for VMEs sorted by modification date
+poetry run python tools/tc_api.py items search --type VME --sort -ModifiedDate --page-size 10
+
+# Search with custom fields
+poetry run python tools/tc_api.py items search --type VME --field SuperDesign=11206229 --field IsVariant=true
+
+# Export search results as CSV
+poetry run python tools/tc_api.py items search --type VME --format csv --output vmes.csv
+
+# Find items referencing a specific VME
+poetry run python tools/tc_api.py items refs VX0003626
+
+# Get a BOM with exploded tree
+poetry run python tools/tc_api.py bom get 50075309 --explode
+
+# Get recipe data
+poetry run python tools/tc_api.py recipes get 6448586
+
+# Resolve a design ID
+poetry run python tools/tc_api.py resolver 11206886
+
+# Get magic hash for upload
+poetry run python tools/tc_api.py magic VX0003001 A
+
+# List all decoration elements
+poetry run python tools/tc_api.py report --type decoration
+
+# Checkout items (dry-run to preview)
+poetry run python tools/tc_api.py items checkout VX0003001 --dry-run --env dev
+
+# Set references on an item
+poetry run python tools/tc_api.py items set-refs VX1000556 --ref VX0002544:B:VariantOf
+
+# Trigger render workflow
+poetry run python tools/tc_api.py items workflow LE7_RENDER_WORKFLOW VX0003001 --env dev
+
+# Search using Y950 scheme
+poetry run python tools/tc_api.py bom search Y950 --field materialNo=50075309
+```
 
 ### Running Without Maya (Bundled Environment)
 
