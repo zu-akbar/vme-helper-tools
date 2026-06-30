@@ -14,6 +14,16 @@ TC_URLS = {
     "dev": "https://dkatcpr-a1.corp.lego.com/legotcapi2",
 }
 
+TC_SUPPORT_URLS = {
+    "prod": "https://dkaapp-res.corp.lego.com:8443/legotcapi2/Support",
+    "dev": "https://dkadev-api.corp.lego.com:8443/legotcapi2/Support",
+}
+
+TC_API_VARIANTS = {
+    "default": TC_URLS,
+    "support": TC_SUPPORT_URLS,
+}
+
 
 def _ensure_lego_ca_bundle():
     """Point requests at the LEGO CA certificate bundle shipped in dep-dwf-maya-python.
@@ -38,18 +48,22 @@ def _ensure_lego_ca_bundle():
         logger.debug(f"REQUESTS_CA_BUNDLE set to: {ca_path}")
 
 
-def create_tc_session(environment, *, client_id=None, authority=None, scopes=None, timeout=120, dryrun=False):
+def create_tc_session(environment, *, api="default", client_id=None, authority=None, scopes=None, timeout=120, dryrun=False):
     """Create an authenticated Team Center session.
 
     Requires team_center.TeamCenter.Session to be importable (via ensure_dep_paths_on_sys_path).
+
+    *api* selects the URL variant: "default" for the standard endpoints,
+    "support" for the Support API (different hosts/port).
     """
     from team_center.TeamCenter import Session as TeamCenterSession
 
     _ensure_lego_ca_bundle()
 
-    if not os.environ.get("TC_URL") and environment in TC_URLS:
-        os.environ["TC_URL"] = TC_URLS[environment]
-        logger.debug(f"TC_URL set to: {TC_URLS[environment]}")
+    url_map = TC_API_VARIANTS.get(api, TC_URLS)
+    if not os.environ.get("TC_URL") and environment in url_map:
+        os.environ["TC_URL"] = url_map[environment]
+        logger.debug(f"TC_URL set to: {url_map[environment]} (api={api})")
 
     msal_app = create_msal_app(client_id=client_id, authority=authority)
     auth = BearerAuth(msal_app, scopes=scopes or SCOPES)

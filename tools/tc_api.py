@@ -243,6 +243,8 @@ def _common_parent():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--env", choices=["dev", "prod"], default="prod",
                    help="Team Center environment (default: prod)")
+    p.add_argument("--api", choices=["default", "support"], default="default",
+                   help="API variant: 'default' or 'support' (default: default)")
     p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                    default="INFO", help="Logging verbosity (default: INFO)")
     p.add_argument("--log-file", metavar="PATH", help="Also write log output to this file")
@@ -447,7 +449,7 @@ def main():
         sys.exit(1)
 
     try:
-        session = create_tc_session(args.env, timeout=args.timeout, dryrun=args.dry_run)
+        session = create_tc_session(args.env, api=args.api, timeout=args.timeout, dryrun=args.dry_run)
     except Exception as e:
         logger.error(f"Failed to connect: {e}")
         sys.exit(1)
